@@ -1,7 +1,3 @@
 {
-<<<<<<< HEAD
-    "java.configuration.updateBuildConfiguration": "interactive"
-=======
     "java.compile.nullAnalysis.mode": "automatic"
->>>>>>> 04780c1 (Add configuration files for application settings and central application)
 }
