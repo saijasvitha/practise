@@ -1,4 +1,5 @@
 """LLM debugging agents (Gemini free tier or Claude Sonnet) that return a structured analysis."""
+import asyncio
 import json
 import logging
 import re
@@ -168,6 +169,8 @@ class DebugAgent:
 
 
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+GEMINI_RETRY_DELAYS = (3,)  # seconds between attempts on one model for 429/5xx; then the next fallback model
+RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 
 JSON_SHAPE = """Respond with ONLY a JSON object in exactly this shape:
 {
@@ -194,7 +197,33 @@ class GeminiAgent:
         self.model = model or settings.gemini_model
         self._http = http_client
 
-    async def _generate(self, system: str, user: str, json_mode: bool) -> str:
+    async def _post_with_retry(
+        self, client: httpx.AsyncClient, body: dict, headers: dict
+    ) -> tuple[httpx.Response, str]:
+        """Retries transient failures (429/5xx/network) per model, then falls back to the next model.
+
+        Returns the response and the model that produced it."""
+        models_to_try = [self.model] + [m for m in settings.gemini_fallback_models if m != self.model]
+        last_resp: Optional[httpx.Response] = None
+        last_model = self.model
+        last_error = ""
+        for model in models_to_try:
+            for attempt in range(len(GEMINI_RETRY_DELAYS) + 1):
+                try:
+                    resp = await client.post(GEMINI_URL.format(model=model), json=body, headers=headers)
+                    if resp.status_code not in RETRYABLE_STATUS:
+                        return resp, model
+                    last_resp, last_model = resp, model
+                except httpx.HTTPError as exc:
+                    last_error = repr(exc)
+                if attempt < len(GEMINI_RETRY_DELAYS):
+                    await asyncio.sleep(GEMINI_RETRY_DELAYS[attempt])
+            logger.warning("Gemini model %s unavailable, trying next fallback", model)
+        if last_resp is not None:
+            return last_resp, last_model
+        raise AgentError(f"Gemini request failed: {last_error}")
+
+    async def _generate(self, system: str, user: str, json_mode: bool) -> tuple[str, str]:
         if not settings.gemini_api_key:
             raise AgentError("GEMINI_API_KEY is not configured")
         config = {"temperature": 0.2}
@@ -208,9 +237,7 @@ class GeminiAgent:
         headers = {"x-goog-api-key": settings.gemini_api_key}
         client = self._http or httpx.AsyncClient(timeout=settings.llm_timeout_seconds)
         try:
-            resp = await client.post(GEMINI_URL.format(model=self.model), json=body, headers=headers)
-        except httpx.HTTPError as exc:
-            raise AgentError(f"Gemini request failed: {exc!r}") from exc
+            resp, model_used = await self._post_with_retry(client, body, headers)
         finally:
             if self._http is None:
                 await client.aclose()
@@ -222,23 +249,25 @@ class GeminiAgent:
 
         try:
             parts = resp.json()["candidates"][0]["content"]["parts"]
-            return "".join(p.get("text", "") for p in parts if not p.get("thought"))
+            return "".join(p.get("text", "") for p in parts if not p.get("thought")), model_used
         except (KeyError, IndexError, ValueError) as exc:
             raise AgentError("Gemini returned no usable content (it may have been blocked)") from exc
 
     async def recommend_prompt(self, req: AcceptRequest) -> str:
-        text = (await self._generate(PROMPT_WRITER_SYSTEM, issue_summary(req), json_mode=False)).strip()
-        if not text:
+        text, _ = await self._generate(PROMPT_WRITER_SYSTEM, issue_summary(req), json_mode=False)
+        if not text.strip():
             raise AgentError("Gemini returned an empty prompt")
-        return text
+        return text.strip()
 
     async def investigate(
         self, req: AcceptRequest, logs: Optional[list[str]] = None, guidance: Optional[str] = None
     ) -> Analysis:
-        text = await self._generate(
+        text, model_used = await self._generate(
             SYSTEM_PROMPT + "\n\n" + JSON_SHAPE, build_user_prompt(req, logs, guidance), json_mode=True
         )
-        return parse_json_analysis(text)
+        analysis = parse_json_analysis(text)
+        analysis.model_used = model_used
+        return analysis
 
 
 def create_agent():

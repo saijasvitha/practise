@@ -64,6 +64,9 @@ def reports_dir(tmp_path, monkeypatch):
     monkeypatch.setattr(models.settings, "service_api_key", "")
     monkeypatch.setattr(models.settings, "callback_url", "")
     monkeypatch.setattr(models.settings, "callback_api_key", "")
+    monkeypatch.setattr(models.settings, "central_url", "")
+    monkeypatch.setattr("agent.GEMINI_RETRY_DELAYS", (0, 0))
+    monkeypatch.setattr(models.settings, "gemini_fallback_models", [])
 
 
 def test_accept_then_success_and_report():
@@ -164,6 +167,42 @@ def test_gemini_garbage_output_fails(monkeypatch):
     with gemini_client(lambda r: httpx.Response(200, json=body)) as c:
         c.post("/api/investigations", json=PAYLOAD)
         assert c.get("/api/investigations/BUG-1").json()["status"] == "FAILED"
+
+
+def test_gemini_retries_transient_overload(monkeypatch):
+    monkeypatch.setattr(models.settings, "gemini_api_key", "test-key")
+    attempts = {"json": 0}
+
+    def handler(request: httpx.Request):
+        if json.loads(request.content)["generationConfig"].get("responseMimeType"):
+            attempts["json"] += 1
+            if attempts["json"] < 3:
+                return httpx.Response(503, json={"error": {"status": "UNAVAILABLE"}})
+            return httpx.Response(200, json={"candidates": [{"content": {"parts": [{"text": GEMINI_JSON}]}}]})
+        return httpx.Response(200, json={"candidates": [{"content": {"parts": [{"text": "a prompt"}]}}]})
+
+    with gemini_client(handler) as c:
+        c.post("/api/investigations", json=PAYLOAD)
+        assert c.get("/api/investigations/BUG-1").json()["status"] == "SUCCESS"
+    assert attempts["json"] == 3
+
+
+def test_gemini_falls_back_to_another_model_when_overloaded(monkeypatch):
+    monkeypatch.setattr(models.settings, "gemini_api_key", "test-key")
+    monkeypatch.setattr(models.settings, "gemini_fallback_models", ["backup-model"])
+
+    def handler(request: httpx.Request):
+        if "gemini-test:" in str(request.url):
+            return httpx.Response(503, json={"error": {"status": "UNAVAILABLE"}})
+        text = GEMINI_JSON if json.loads(request.content)["generationConfig"].get("responseMimeType") else "a prompt"
+        return httpx.Response(200, json={"candidates": [{"content": {"parts": [{"text": text}]}}]})
+
+    with gemini_client(handler) as c:
+        c.post("/api/investigations", json=PAYLOAD)
+        d = c.get("/api/investigations/BUG-1/details").json()
+    assert d["status"] == "SUCCESS" and d["model"] == "backup-model"
+    assert d["analysis"]["model_used"] == "backup-model"
+    assert any("fallback model backup-model" in e["event"] for e in d["audit"])
 
 
 def test_parse_log_payload_formats():
@@ -340,4 +379,180 @@ def test_finished_investigation_triggers_callback(monkeypatch):
         d = c.get("/api/investigations/BUG-1/details").json()
     assert len(sent) == 1 and sent[0].status.value == "SUCCESS" and sent[0].success is True
     assert any("Backend notification" in e["event"] for e in d["audit"])
+
+
+def test_normalize_incident_handles_common_field_names():
+    from central import normalize_incident
+
+    doc = {"id": "7", "bugDescription": "DB down", "serviceName": "orders", "priority": "high",
+           "logLines": ["ERROR a", "ERROR b"]}
+    assert normalize_incident(doc) == {
+        "description": "DB down", "service": "orders", "severity": "high", "logs": ["ERROR a", "ERROR b"],
+    }
+    assert normalize_incident({"logs": "l1\nl2", "message": "m"})["logs"] == ["l1", "l2"]
+    assert "unknown" in normalize_incident({"id": "1", "weird": "unknown"})["description"]
+
+
+def test_fetch_incident_from_central(monkeypatch):
+    from central import fetch_incident
+
+    monkeypatch.setattr(models.settings, "central_url", "http://central.test:8080")
+    seen = []
+
+    def handler(request: httpx.Request):
+        seen.append(str(request.url))
+        if request.url.path.endswith("/MISSING"):
+            return httpx.Response(404)
+        if request.url.path.endswith("/BROKEN"):
+            return httpx.Response(500)
+        return httpx.Response(200, json={"id": "BUG-9", "description": "Cart fails", "service": "cart"})
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    data, note = run(fetch_incident("BUG-9", http))
+    assert data["description"] == "Cart fails" and seen[0] == "http://central.test:8080/api/incidents/BUG-9"
+    assert run(fetch_incident("MISSING", http))[0] is None
+    data, note = run(fetch_incident("BROKEN", http))
+    assert data is None and "unavailable" in note
+
+
+def test_description_required_unless_central_configured(monkeypatch):
+    with make_client(FakeClient(tool_response(0.9))) as c:
+        assert c.post("/api/investigations", json={"bug_id": "BUG-1"}).status_code == 422
+
+    monkeypatch.setattr(models.settings, "central_url", "http://central.test:8080")
+    seen = {}
+
+    async def fake_fetch(bug_id, http=None):
+        return {"description": "Cart fails", "service": "cart", "logs": ["ERROR cart npe"]}, "fetched"
+
+    monkeypatch.setattr("app.fetch_incident", fake_fetch)
+    fake = FakeClient(tool_response(0.9))
+    with make_client(fake) as c:
+        assert c.post("/api/investigations", json={"bug_id": "BUG-1"}).status_code == 202
+        d = c.get("/api/investigations/BUG-1/details").json()
+        assert d["status"] == "SUCCESS"
+        assert d["request"]["description"] == "Cart fails" and d["request"]["service"] == "cart"
+    assert "ERROR cart npe" in fake.calls[-1]["messages"][0]["content"]
+
+
+def test_central_down_and_no_description_fails_clearly(monkeypatch):
+    monkeypatch.setattr(models.settings, "central_url", "http://central.test:8080")
+
+    async def fake_fetch(bug_id, http=None):
+        return None, "central service unavailable"
+
+    monkeypatch.setattr("app.fetch_incident", fake_fetch)
+    with make_client(FakeClient(tool_response(0.9))) as c:
+        c.post("/api/investigations", json={"bug_id": "BUG-1"})
+        d = c.get("/api/investigations/BUG-1/details").json()
+        assert d["status"] == "FAILED" and "description is missing" in d["error"]
+
+
+def test_central_down_but_description_given_still_succeeds(monkeypatch):
+    monkeypatch.setattr(models.settings, "central_url", "http://central.test:8080")
+
+    async def fake_fetch(bug_id, http=None):
+        return None, "central service unavailable"
+
+    monkeypatch.setattr("app.fetch_incident", fake_fetch)
+    with make_client(FakeClient(tool_response(0.9))) as c:
+        c.post("/api/investigations", json=PAYLOAD)
+        assert c.get("/api/investigations/BUG-1").json()["status"] == "SUCCESS"
+
+
+def test_callback_url_supports_bug_id_placeholder(monkeypatch):
+    from callback import notify_callback
+
+    monkeypatch.setattr(models.settings, "callback_url", "http://central.test:8080/api/incidents/{bug_id}/ai-result")
+    seen = []
+    http = httpx.AsyncClient(transport=httpx.MockTransport(lambda r: (seen.append(str(r.url)), httpx.Response(200))[1]))
+    summary = models.InvestigationSummary(
+        bug_id="BUG 1", status=models.InvestigationStatus.SUCCESS, message="ok", success=True
+    )
+    run(notify_callback(summary, http))
+    assert seen == ["http://central.test:8080/api/incidents/BUG%201/ai-result"]
+
+
+def test_push_status_calls_central_with_marker_header(monkeypatch):
+    from central import push_status
+
+    monkeypatch.setattr(models.settings, "central_url", "http://central.test:8080")
+    calls = []
+
+    def handler(request: httpx.Request):
+        calls.append((request.method, str(request.url), request.headers.get("x-initiated-by")))
+        return httpx.Response(200)
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    assert "succeeded" in run(push_status("BUG-1", "approve", http))
+    assert calls == [("POST", "http://central.test:8080/api/incidents/BUG-1/approve", "ai-agent")]
+
+    bad = httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(404)))
+    assert "failed" in run(push_status("BUG-1", "reject", bad))
+
+
+def central_pushes(monkeypatch):
+    monkeypatch.setattr(models.settings, "central_url", "http://central.test:8080")
+    pushed = []
+
+    async def fake_fetch(bug_id, http=None):
+        return {"description": "Cart fails", "service": "cart", "logs": ["ERROR cart npe"]}, "fetched"
+
+    async def fake_push(bug_id, action, http=None):
+        pushed.append((bug_id, action))
+        return f"central {action} succeeded (HTTP 200)"
+
+    monkeypatch.setattr("app.fetch_incident", fake_fetch)
+    monkeypatch.setattr("app.push_status", fake_push)
+    return pushed
+
+
+def test_success_pushes_approve_to_central(monkeypatch):
+    pushed = central_pushes(monkeypatch)
+    with make_client(FakeClient(tool_response(0.9))) as c:
+        c.post("/api/investigations", json={"bug_id": "BUG-1"})
+        d = c.get("/api/investigations/BUG-1/details").json()
+    assert pushed == [("BUG-1", "approve")]
+    assert d["log_source"] == "central service" and d["log_line_count"] == 1
+    assert any("central approve succeeded" in e["event"] for e in d["audit"])
+
+
+def test_failure_pushes_reject_to_central(monkeypatch):
+    pushed = central_pushes(monkeypatch)
+    with make_client(FakeClient(error=RuntimeError("boom"))) as c:
+        c.post("/api/investigations", json={"bug_id": "BUG-1"})
+        assert c.get("/api/investigations/BUG-1").json()["status"] == "FAILED"
+    assert pushed == [("BUG-1", "reject")]
+
+
+def test_low_confidence_pushes_nothing(monkeypatch):
+    pushed = central_pushes(monkeypatch)
+    with make_client(FakeClient(tool_response(0.2))) as c:
+        c.post("/api/investigations", json={"bug_id": "BUG-1"})
+        d = c.get("/api/investigations/BUG-1/details").json()
+    assert pushed == [] and d["status"] == "NEEDS_REVIEW"
+    assert any("No status pushed" in e["event"] for e in d["audit"])
+
+
+def test_push_can_be_disabled(monkeypatch):
+    pushed = central_pushes(monkeypatch)
+    monkeypatch.setattr(models.settings, "central_push_status", False)
+    with make_client(FakeClient(tool_response(0.9))) as c:
+        c.post("/api/investigations", json={"bug_id": "BUG-1"})
+    assert pushed == []
+
+
+def test_callback_from_central_after_success_does_not_loop(monkeypatch):
+    pushed = central_pushes(monkeypatch)
+    fake = FakeClient(tool_response(0.9))
+    with make_client(fake) as c:
+        c.post("/api/investigations", json={"bug_id": "BUG-1"})
+        calls_after_first_run = len(fake.calls)
+        again = c.post("/api/investigations", json={"bug_id": "BUG-1"})  # central re-calls us after approve
+        assert again.status_code == 200 and again.json()["status"] == "SUCCESS"
+        assert len(fake.calls) == calls_after_first_run and pushed == [("BUG-1", "approve")]
+
+        forced = c.post("/api/investigations?force=true", json={"bug_id": "BUG-1"})
+        assert forced.status_code == 202
+        assert len(fake.calls) > calls_after_first_run
 

@@ -40,10 +40,28 @@ docker compose up --build   # http://localhost:8000, data persisted in Docker vo
 
 Typical wiring: dashboard -> incident backend -> `POST /api/investigations` on this service -> backend receives the callback (or polls `GET /api/investigations/{bug_id}`) and shows success/failure.
 
+## Integrating with the Central incident service (port 8080)
+The Spring Boot `Central` service exposes `GET /api/incidents`, `GET /api/incidents/{id}`, `POST /api/incidents/{id}/approve` and `POST /api/incidents/{id}/reject`.
+
+- **This service -> Central:** with `CENTRAL_API_URL=http://localhost:8080`, `GET /api/incidents/{bug_id}` is called to fetch the description, service, severity and logs, so callers can send only `{"bug_id": "..."}`. Field names are matched tolerantly (`description`/`bugDescription`/`message`..., `service`/`serviceName`, `severity`/`priority`, `logs`/`logLines`); see `central.py` to add more. If Central is down but the request carries a description, the investigation still runs.
+- **Central -> this service:** when the user clicks the tick, the frontend calls Central's `approve`, and Central's `approveIncident` should call `POST http://<ai-host>:8000/api/investigations` with `{"bug_id": "<id>"}`.
+- **This service -> Central (results):** when an investigation ends, this service calls Central: `SUCCESS` -> `POST /api/incidents/{id}/approve`, `FAILED` -> `POST /api/incidents/{id}/reject`, low confidence (`NEEDS_REVIEW`) -> nothing (left to an engineer). Disable with `CENTRAL_PUSH_STATUS=false`. These calls carry the header `X-Initiated-By: ai-agent`.
+- **Loop protection:** because our `approve` could make Central call this service again, a finished `SUCCESS` investigation is returned as-is instead of re-run (use `POST /api/investigations?force=true` to re-run). Central should also skip calling back when it sees `X-Initiated-By: ai-agent`.
+- **Extra result details:** if Central adds an endpoint to receive the full AI result, set `CALLBACK_URL=http://localhost:8080/api/incidents/{bug_id}/ai-result` (`{bug_id}` is replaced) and it will receive `{bug_id, status, success, message, root_cause, confidence}`.
+
+Spring Boot example (inside `approveIncident`, skipping calls that came from the AI agent):
+```java
+// parameter: @RequestHeader(value = "X-Initiated-By", required = false) String initiatedBy
+if (!"ai-agent".equals(initiatedBy)) {
+    RestClient.create("http://localhost:8000").post().uri("/api/investigations")
+        .contentType(MediaType.APPLICATION_JSON).body(Map.of("bug_id", id)).retrieve().toBodilessEntity();
+}
+```
+
 ## API
 | Method | Path | Purpose |
 |---|---|---|
-| POST | `/api/investigations` | Tick mark clicked. Body: `bug_id`, `description` (required); optional `service`, `severity`, `logs[]`, `similar_incidents[]` (from the RAG service). Returns 202 immediately. |
+| POST | `/api/investigations` | Tick mark clicked. Body: `bug_id` (required); `description` is required unless `CENTRAL_API_URL` is set (then it is fetched by id); optional `service`, `severity`, `logs[]`, `similar_incidents[]` (from the RAG service). Returns 202 immediately; 200 with the existing result if already running or already `SUCCESS` (`?force=true` re-runs). |
 | GET | `/api/investigations/{bug_id}` | Poll for result: `status`, `success`, `message`, `root_cause`, `confidence`. |
 | GET | `/api/investigations/{bug_id}/details` | Full analysis, evidence, remediation and audit trail. |
 | GET | `/api/investigations/{bug_id}/report` | Final investigation report (Markdown). Also saved to `reports/<bug_id>.md`. |
@@ -54,6 +72,7 @@ Status values: `QUEUED`, `IN_PROGRESS`, `SUCCESS` (show "success" to the user), 
 - `app.py` – FastAPI routes and background investigation flow
 - `agent.py` – `GeminiAgent` (REST, free tier) and `DebugAgent` (Claude Sonnet); `create_agent()` picks one via `LLM_PROVIDER`
 - `callback.py` – notifies the backend when an investigation finishes
+- `central.py` – reads incident details from the Central service (`GET /api/incidents/{id}`)
 - `store.py` – persists investigations to disk
 - `Dockerfile`, `docker-compose.yml` – container packaging
 - `logs.py` – fetches logs from the log REST API, falling back to a local file

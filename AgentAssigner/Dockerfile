@@ -10,7 +10,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY agent.py app.py callback.py logs.py models.py report.py store.py ./
+COPY agent.py app.py callback.py central.py logs.py models.py report.py store.py ./
 
 RUN useradd --create-home appuser && mkdir -p /app/data /app/reports && chown -R appuser /app
 USER appuser

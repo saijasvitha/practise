@@ -2,6 +2,7 @@
 import asyncio
 import logging
 from typing import Optional
+from urllib.parse import quote
 
 import httpx
 
@@ -20,12 +21,13 @@ async def notify_callback(
         return "no callback configured"
     headers = {"X-API-Key": settings.callback_api_key} if settings.callback_api_key else {}
     client = http or httpx.AsyncClient(timeout=10)
+    url = settings.callback_url.replace("{bug_id}", quote(summary.bug_id, safe=""))
     payload = summary.model_dump(mode="json")
     last_error = ""
     try:
         for attempt in range(len(RETRY_DELAYS) + 1):
             try:
-                resp = await client.post(settings.callback_url, json=payload, headers=headers)
+                resp = await client.post(url, json=payload, headers=headers)
                 if resp.status_code < 300:
                     return f"callback delivered (HTTP {resp.status_code})"
                 last_error = f"HTTP {resp.status_code}"

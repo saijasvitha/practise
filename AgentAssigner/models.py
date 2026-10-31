@@ -14,6 +14,10 @@ class Settings:
     llm_provider: str = os.getenv("LLM_PROVIDER", "gemini").lower()  # gemini | anthropic
     gemini_api_key: str = os.getenv("GEMINI_API_KEY", "")
     gemini_model: str = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
+    # Tried in order when the primary model keeps returning 429/5xx
+    gemini_fallback_models: list[str] = [
+        m.strip() for m in os.getenv("GEMINI_FALLBACK_MODELS", "gemini-3.5-flash-lite,gemini-flash-lite-latest").split(",") if m.strip()
+    ]
     anthropic_api_key: str = os.getenv("ANTHROPIC_API_KEY", "")
     anthropic_model: str = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-5")
     success_confidence_threshold: float = float(os.getenv("SUCCESS_CONFIDENCE_THRESHOLD", "0.6"))
@@ -28,6 +32,10 @@ class Settings:
     service_api_key: str = os.getenv("SERVICE_API_KEY", "")  # if set, callers must send X-API-Key
     callback_url: str = os.getenv("CALLBACK_URL", "")  # backend endpoint notified when an investigation ends
     callback_api_key: str = os.getenv("CALLBACK_API_KEY", "")
+    # Central incident service (Spring Boot), e.g. http://localhost:8080 ; used for GET /api/incidents/{id}
+    central_url: str = os.getenv("CENTRAL_API_URL", "").rstrip("/")
+    # After an investigation: SUCCESS -> POST approve, FAILED -> POST reject on the central service
+    central_push_status: bool = os.getenv("CENTRAL_PUSH_STATUS", "true").lower() in ("1", "true", "yes")
     data_dir: str = os.getenv("DATA_DIR", "data")  # investigations are persisted here
 
 
@@ -57,7 +65,8 @@ class SimilarIncident(BaseModel):
 class AcceptRequest(BaseModel):
     """Payload sent when the user clicks the tick mark on a bug."""
     bug_id: str = Field(min_length=1)
-    description: str = Field(min_length=1)
+    # Optional when CENTRAL_API_URL is set: it is then fetched from GET /api/incidents/{bug_id}
+    description: Optional[str] = Field(default=None, min_length=1)
     service: Optional[str] = None
     severity: Optional[str] = None
     logs: list[str] = Field(default_factory=list)
@@ -83,6 +92,7 @@ class Analysis(BaseModel):
     remediation: list[RemediationStep] = Field(default_factory=list)
     stakeholder_summary: str = ""
     kb_article_title: str = ""
+    model_used: Optional[str] = None  # set by the service, not by the LLM
 
 
 class Investigation(BaseModel):

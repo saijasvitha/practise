@@ -64,12 +64,14 @@ def _read_log_file(req: AcceptRequest) -> list[str]:
     return relevant or lines
 
 
-async def fetch_logs(req: AcceptRequest, http: Optional[httpx.AsyncClient] = None) -> LogResult:
+async def fetch_logs(
+    req: AcceptRequest, http: Optional[httpx.AsyncClient] = None, request_label: str = "request body"
+) -> LogResult:
     """Fetches from the log REST API, falling back to a local file; request-supplied logs are added."""
     fetched = await _fetch_configured_logs(req, http)
     if req.logs:
         fetched.lines = (fetched.lines + req.logs)[-settings.log_max_lines :]
-        fetched.source = "request body" if fetched.source == "none" else fetched.source + " + request body"
+        fetched.source = request_label if fetched.source == "none" else f"{fetched.source} + {request_label}"
     return fetched
 
 

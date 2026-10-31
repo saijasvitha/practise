@@ -11,6 +11,7 @@ from fastapi.responses import PlainTextResponse, RedirectResponse
 import store
 from agent import AgentError, create_agent, default_guidance
 from callback import notify_callback
+from central import fetch_incident, push_status
 from logs import fetch_logs
 from models import (
     AcceptRequest,
@@ -25,6 +26,7 @@ from report import build_report, save_report
 logger = logging.getLogger(__name__)
 
 ACTIVE = {InvestigationStatus.QUEUED, InvestigationStatus.IN_PROGRESS}
+STATUS_ACTION = {InvestigationStatus.SUCCESS: "approve", InvestigationStatus.FAILED: "reject"}
 
 
 def log_event(inv: Investigation, event: str) -> None:
@@ -45,6 +47,27 @@ def summarize(inv: Investigation) -> InvestigationSummary:
     )
 
 
+async def enrich_from_central(inv: Investigation) -> bool:
+    """Fills missing description/service/severity/logs from the central incident service.
+
+    Returns True when the logs were taken from the central service."""
+    logs_from_central = False
+    if settings.central_url:
+        data, note = await fetch_incident(inv.bug_id)
+        log_event(inv, note)
+        if data:
+            req = inv.request
+            update = {k: data[k] for k in ("description", "service", "severity") if not getattr(req, k) and k in data}
+            if not req.logs and data.get("logs"):
+                update["logs"] = data["logs"]
+                logs_from_central = True
+            if update:
+                inv.request = req.model_copy(update=update)
+    if not inv.request.description:
+        raise AgentError("Incident description is missing and could not be fetched from the central service")
+    return logs_from_central
+
+
 async def run_investigation(app: FastAPI, inv: Investigation) -> None:
     agent = app.state.agent
     inv.status = InvestigationStatus.IN_PROGRESS
@@ -53,6 +76,7 @@ async def run_investigation(app: FastAPI, inv: Investigation) -> None:
     inv.model = agent.model
     log_event(inv, "Investigation started by LLM agent")
     try:
+        logs_from_central = await enrich_from_central(inv)
         try:
             inv.investigation_prompt = await agent.recommend_prompt(inv.request)
             log_event(inv, "Agent recommended an investigation prompt for this issue")
@@ -60,13 +84,16 @@ async def run_investigation(app: FastAPI, inv: Investigation) -> None:
             inv.investigation_prompt = default_guidance(inv.request)
             log_event(inv, f"Prompt recommendation failed ({exc}); using default prompt")
 
-        logs = await fetch_logs(inv.request)
+        logs = await fetch_logs(inv.request, request_label="central service" if logs_from_central else "request body")
         inv.log_source, inv.log_line_count = logs.source, len(logs.lines)
         log_event(inv, f"Collected {len(logs.lines)} log lines from: {logs.source}")
         for note in logs.notes:
             log_event(inv, f"Log note: {note}")
 
         inv.analysis = await agent.investigate(inv.request, logs.lines, inv.investigation_prompt)
+        if inv.analysis.model_used and inv.analysis.model_used != inv.model:
+            log_event(inv, f"Primary model unavailable; answered by fallback model {inv.analysis.model_used}")
+            inv.model = inv.analysis.model_used
         confidence = inv.analysis.root_cause.confidence
         log_event(inv, f"Root cause identified: {inv.analysis.root_cause.summary} ({confidence:.0%})")
         if confidence >= settings.success_confidence_threshold:
@@ -98,7 +125,13 @@ async def run_investigation(app: FastAPI, inv: Investigation) -> None:
         outcome = await notify_callback(summarize(inv))
         if settings.callback_url:
             log_event(inv, f"Backend notification: {outcome}")
-            store.save(inv)
+        action = STATUS_ACTION.get(inv.status)
+        if settings.central_url and settings.central_push_status:
+            if action:
+                log_event(inv, await push_status(inv.bug_id, action))
+            else:
+                log_event(inv, "No status pushed to central service (low confidence; left for an engineer)")
+        store.save(inv)
 
 
 async def require_api_key(x_api_key: str | None = Header(default=None)) -> None:
@@ -155,10 +188,16 @@ def create_app(agent=None) -> FastAPI:
     @app.post(
         "/api/investigations", response_model=InvestigationSummary, status_code=202, dependencies=secured
     )
-    async def accept_bug(req: AcceptRequest, background: BackgroundTasks, response: Response):
+    async def accept_bug(
+        req: AcceptRequest, background: BackgroundTasks, response: Response, force: bool = False
+    ):
         """Tick mark clicked: assign the bug to the LLM agent."""
+        if not req.description and not settings.central_url:
+            raise HTTPException(422, "description is required (or set CENTRAL_API_URL to fetch it by bug_id)")
         existing = app.state.investigations.get(req.bug_id)
-        if existing and existing.status in ACTIVE:
+        # A finished SUCCESS is returned as-is: our own approve push makes the central service call
+        # back into this endpoint, which must not start another run (use ?force=true to re-run).
+        if existing and (existing.status in ACTIVE or (existing.status == InvestigationStatus.SUCCESS and not force)):
             response.status_code = 200
             return summarize(existing)
         inv = Investigation(bug_id=req.bug_id, request=req)

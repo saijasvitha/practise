@@ -18,7 +18,7 @@ def build_report(inv: Investigation) -> str:
         f"- **Completed:** {inv.completed_at.isoformat() if inv.completed_at else 'n/a'}",
         "",
         "## Incident",
-        inv.request.description,
+        inv.request.description or "n/a",
         "",
         "## Investigation Prompt (recommended by the agent)",
         inv.investigation_prompt or "n/a",
