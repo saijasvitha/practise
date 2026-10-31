@@ -30,17 +30,44 @@ public class IncidentService {
                 .orElseThrow(() -> new RuntimeException("Incident not found: " + id));
     }
 
-    // Approve an incident
-    public IncidentDocument approveIncident(String id) {
-        IncidentDocument incident = getIncidentById(id);
-        incident.setStatus("APPROVED");
-        return incidentRepository.save(incident);
+    // Approve an incident and trigger AI investigation
+public IncidentDocument approveIncident(String id) {
+
+    IncidentDocument incident = getIncidentById(id);
+
+    incident.setStatus("APPROVED");
+
+    // Save approved incident in MongoDB
+    incidentRepository.save(incident);
+
+    try {
+        // Send incident details to Python AgentAssigner
+        Map response = agentClient.post()
+                .uri("/api/investigations")
+                .body(incident)
+                .retrieve()
+                .body(Map.class);
+
+        // Store AI response in MongoDB
+        incident.setAiReport(response);
+
+        System.out.println("AI investigation triggered successfully!");
+
+    } catch (Exception e) {
+        System.err.println("AgentAssigner error: " + e.getMessage());
     }
 
-    // Reject an incident
-    public IncidentDocument rejectIncident(String id) {
-        IncidentDocument incident = getIncidentById(id);
-        incident.setStatus("REJECTED");
-        return incidentRepository.save(incident);
-    }
+    return incidentRepository.save(incident);
+}
+
+
+// Reject an incident without triggering AI
+public IncidentDocument rejectIncident(String id) {
+
+    IncidentDocument incident = getIncidentById(id);
+
+    incident.setStatus("REJECTED");
+
+    return incidentRepository.save(incident);
+}
 }
