@@ -16,7 +16,7 @@ public class CorsConfig {
             public void addCorsMappings(CorsRegistry registry) {
                 registry.addMapping("/api/**")
                         .allowedOrigins(
-                            "https://YOUR-FRONTEND-CODESPACE-URL"
+                            "https://repulsive-specter-v657wgq94qjghw567-5173.app.github.dev/issues"
                         )
                         .allowedMethods(
                             "GET", "POST", "PUT", "DELETE", "OPTIONS"
