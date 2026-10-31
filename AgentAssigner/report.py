@@ -20,6 +20,12 @@ def build_report(inv: Investigation) -> str:
         "## Incident",
         inv.request.description,
         "",
+        "## Investigation Prompt (recommended by the agent)",
+        inv.investigation_prompt or "n/a",
+        "",
+        "## Logs Analysed",
+        f"{inv.log_line_count} lines from: {inv.log_source or 'none'}",
+        "",
     ]
     if a is None:
         lines += ["## Error", inv.error or "Investigation did not produce an analysis.", ""]

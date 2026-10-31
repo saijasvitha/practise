@@ -1,13 +1,17 @@
 """FastAPI service: accepts a bug when the user clicks the tick mark and hands it to the LLM agent."""
 import logging
 import os
+import secrets
 from contextlib import asynccontextmanager
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Response
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse, RedirectResponse
 
-from agent import AgentError, DebugAgent
+import store
+from agent import AgentError, create_agent, default_guidance
+from callback import notify_callback
+from logs import fetch_logs
 from models import (
     AcceptRequest,
     Investigation,
@@ -42,14 +46,27 @@ def summarize(inv: Investigation) -> InvestigationSummary:
 
 
 async def run_investigation(app: FastAPI, inv: Investigation) -> None:
-    agent: DebugAgent = app.state.agent
+    agent = app.state.agent
     inv.status = InvestigationStatus.IN_PROGRESS
     inv.message = "Agent is debugging the issue"
     inv.started_at = utcnow()
     inv.model = agent.model
     log_event(inv, "Investigation started by LLM agent")
     try:
-        inv.analysis = await agent.investigate(inv.request)
+        try:
+            inv.investigation_prompt = await agent.recommend_prompt(inv.request)
+            log_event(inv, "Agent recommended an investigation prompt for this issue")
+        except AgentError as exc:
+            inv.investigation_prompt = default_guidance(inv.request)
+            log_event(inv, f"Prompt recommendation failed ({exc}); using default prompt")
+
+        logs = await fetch_logs(inv.request)
+        inv.log_source, inv.log_line_count = logs.source, len(logs.lines)
+        log_event(inv, f"Collected {len(logs.lines)} log lines from: {logs.source}")
+        for note in logs.notes:
+            log_event(inv, f"Log note: {note}")
+
+        inv.analysis = await agent.investigate(inv.request, logs.lines, inv.investigation_prompt)
         confidence = inv.analysis.root_cause.confidence
         log_event(inv, f"Root cause identified: {inv.analysis.root_cause.summary} ({confidence:.0%})")
         if confidence >= settings.success_confidence_threshold:
@@ -77,13 +94,25 @@ async def run_investigation(app: FastAPI, inv: Investigation) -> None:
             save_report(inv)
         except OSError:
             logger.exception("Could not save report for %s", inv.bug_id)
+        store.save(inv)
+        outcome = await notify_callback(summarize(inv))
+        if settings.callback_url:
+            log_event(inv, f"Backend notification: {outcome}")
+            store.save(inv)
 
 
-def create_app(agent: DebugAgent | None = None) -> FastAPI:
+async def require_api_key(x_api_key: str | None = Header(default=None)) -> None:
+    """Service-to-service auth: enforced only when SERVICE_API_KEY is configured."""
+    expected = settings.service_api_key
+    if expected and not secrets.compare_digest(x_api_key or "", expected):
+        raise HTTPException(401, "Missing or invalid X-API-Key")
+
+
+def create_app(agent=None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        app.state.agent = agent or DebugAgent()
-        app.state.investigations = {}
+        app.state.agent = agent or create_agent()
+        app.state.investigations = store.load_all()
         yield
 
     app = FastAPI(title="Incident War Room - AI Agent Service", version="1.0.0", lifespan=lifespan)
@@ -91,6 +120,7 @@ def create_app(agent: DebugAgent | None = None) -> FastAPI:
     app.add_middleware(
         CORSMiddleware, allow_origins=origins, allow_methods=["*"], allow_headers=["*"]
     )
+    secured = [Depends(require_api_key)]
 
     def get_inv(bug_id: str) -> Investigation:
         inv = app.state.investigations.get(bug_id)
@@ -104,9 +134,27 @@ def create_app(agent: DebugAgent | None = None) -> FastAPI:
 
     @app.get("/health")
     async def health():
-        return {"status": "ok", "model": app.state.agent.model}
+        """Liveness probe: the process is up."""
+        return {"status": "ok", "provider": settings.llm_provider, "model": app.state.agent.model}
 
-    @app.post("/api/investigations", response_model=InvestigationSummary, status_code=202)
+    @app.get("/ready")
+    async def ready(response: Response):
+        """Readiness probe: the service can actually run investigations."""
+        key_set = bool(
+            settings.anthropic_api_key if settings.llm_provider == "anthropic" else settings.gemini_api_key
+        )
+        checks = {
+            "llm_api_key": key_set,
+            "log_source_configured": bool(settings.log_api_url or settings.log_file_path),
+            "callback_configured": bool(settings.callback_url),
+        }
+        if not key_set:
+            response.status_code = 503
+        return {"ready": key_set, "checks": checks}
+
+    @app.post(
+        "/api/investigations", response_model=InvestigationSummary, status_code=202, dependencies=secured
+    )
     async def accept_bug(req: AcceptRequest, background: BackgroundTasks, response: Response):
         """Tick mark clicked: assign the bug to the LLM agent."""
         existing = app.state.investigations.get(req.bug_id)
@@ -116,19 +164,22 @@ def create_app(agent: DebugAgent | None = None) -> FastAPI:
         inv = Investigation(bug_id=req.bug_id, request=req)
         log_event(inv, "Bug accepted by user and assigned to LLM agent")
         app.state.investigations[req.bug_id] = inv
+        store.save(inv)
         background.add_task(run_investigation, app, inv)
         return summarize(inv)
 
-    @app.get("/api/investigations/{bug_id}", response_model=InvestigationSummary)
+    @app.get("/api/investigations/{bug_id}", response_model=InvestigationSummary, dependencies=secured)
     async def get_status(bug_id: str):
         """Polled by the dashboard to display success / failure."""
         return summarize(get_inv(bug_id))
 
-    @app.get("/api/investigations/{bug_id}/details", response_model=Investigation)
+    @app.get("/api/investigations/{bug_id}/details", response_model=Investigation, dependencies=secured)
     async def get_details(bug_id: str):
         return get_inv(bug_id)
 
-    @app.get("/api/investigations/{bug_id}/report", response_class=PlainTextResponse)
+    @app.get(
+        "/api/investigations/{bug_id}/report", response_class=PlainTextResponse, dependencies=secured
+    )
     async def get_report(bug_id: str):
         inv = get_inv(bug_id)
         if inv.status in ACTIVE or inv.report_markdown is None:

@@ -1,0 +1,20 @@
+# Run standalone:   docker compose up --build
+# Other teams reach this service at http://ai-agent-service:8000 (same compose network)
+# or http://localhost:8000 from the host. Secrets come from .env (never committed).
+services:
+  ai-agent-service:
+    build: .
+    container_name: ai-agent-service
+    env_file: .env
+    ports:
+      - "8000:8000"
+    volumes:
+      - agent-data:/app/data
+      - agent-reports:/app/reports
+      # Optional: mount a log folder and set LOG_FILE_PATH=/logs in .env
+      # - ./sample-logs:/logs:ro
+    restart: unless-stopped
+
+volumes:
+  agent-data:
+  agent-reports:

@@ -11,11 +11,24 @@ load_dotenv()
 
 
 class Settings:
+    llm_provider: str = os.getenv("LLM_PROVIDER", "gemini").lower()  # gemini | anthropic
+    gemini_api_key: str = os.getenv("GEMINI_API_KEY", "")
+    gemini_model: str = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
     anthropic_api_key: str = os.getenv("ANTHROPIC_API_KEY", "")
     anthropic_model: str = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-5")
     success_confidence_threshold: float = float(os.getenv("SUCCESS_CONFIDENCE_THRESHOLD", "0.6"))
     reports_dir: str = os.getenv("REPORTS_DIR", "reports")
     llm_timeout_seconds: float = float(os.getenv("LLM_TIMEOUT_SECONDS", "90"))
+    # e.g. http://localhost:9000/logs?service={service}; {service} and {bug_id} are filled in
+    log_api_url: str = os.getenv("LOG_API_URL", "")
+    log_file_path: str = os.getenv("LOG_FILE_PATH", "")  # file, or a folder (newest .log/.txt is used)
+    log_max_lines: int = int(os.getenv("LOG_MAX_LINES", "200"))
+    log_timeout_seconds: float = float(os.getenv("LOG_TIMEOUT_SECONDS", "10"))
+    # Microservice integration
+    service_api_key: str = os.getenv("SERVICE_API_KEY", "")  # if set, callers must send X-API-Key
+    callback_url: str = os.getenv("CALLBACK_URL", "")  # backend endpoint notified when an investigation ends
+    callback_api_key: str = os.getenv("CALLBACK_API_KEY", "")
+    data_dir: str = os.getenv("DATA_DIR", "data")  # investigations are persisted here
 
 
 settings = Settings()
@@ -78,6 +91,9 @@ class Investigation(BaseModel):
     status: InvestigationStatus = InvestigationStatus.QUEUED
     message: str = "Investigation queued"
     model: Optional[str] = None
+    investigation_prompt: Optional[str] = None
+    log_source: Optional[str] = None
+    log_line_count: int = 0
     analysis: Optional[Analysis] = None
     error: Optional[str] = None
     report_markdown: Optional[str] = None
