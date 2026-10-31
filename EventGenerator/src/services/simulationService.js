@@ -29,6 +29,7 @@ const TOTAL_STEPS = 6;
 
 const simulations = new Map();
 
+
 // Start a new simulation
 const startSimulation = ({
     scenario,
@@ -101,6 +102,13 @@ const startSimulation = ({
             // Publish log to RabbitMQ
             await publishLog(log);
 
+            // IMPORTANT:
+            // Check whether the simulation was stopped
+            // while RabbitMQ publishing was in progress.
+            if (simulation.status !== "RUNNING") {
+                return;
+            }
+
             // Update simulation state after confirmation
             simulation.currentStep = step;
             simulation.logs.push(log);
@@ -132,12 +140,18 @@ const startSimulation = ({
 
         } catch (error) {
 
+            // Do not overwrite STOPPED with FAILED
+            if (simulation.status !== "RUNNING") {
+                return;
+            }
+
             simulation.status = "FAILED";
             simulation.error = error.message;
             simulation.endTime = new Date().toISOString();
 
             if (simulation.timer) {
                 clearTimeout(simulation.timer);
+                simulation.timer = null;
             }
 
             console.error(
