@@ -7,7 +7,7 @@ spring:
   # MongoDB Configuration
   data:
     mongodb:
-      uri: ${MONGODB_URI}
+      uri: ${mongodb://localhost:27017}
 
   rabbitmq:
     host: localhost
