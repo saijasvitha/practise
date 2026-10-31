@@ -11,7 +11,7 @@ from fastapi.responses import PlainTextResponse, RedirectResponse
 import store
 from agent import AgentError, create_agent, default_guidance
 from callback import notify_callback
-from central import fetch_incident, push_status
+from central import fetch_incident, ping_central, push_status
 from logs import fetch_logs
 from models import (
     AcceptRequest,
@@ -180,7 +180,10 @@ def create_app(agent=None) -> FastAPI:
             "llm_api_key": key_set,
             "log_source_configured": bool(settings.log_api_url or settings.log_file_path),
             "callback_configured": bool(settings.callback_url),
+            "central_configured": bool(settings.central_url),
         }
+        if settings.central_url:  # informational: Central being down does not make this service unready
+            checks["central_reachable"], checks["central_detail"] = await ping_central()
         if not key_set:
             response.status_code = 503
         return {"ready": key_set, "checks": checks}

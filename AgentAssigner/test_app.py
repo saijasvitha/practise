@@ -275,6 +275,25 @@ def test_prompt_and_logs_reach_the_ai_and_report(monkeypatch, tmp_path):
     assert "Look for connection pool errors" in analysis_prompt
 
 
+def test_ready_reports_central_connectivity(monkeypatch):
+    monkeypatch.setattr(models.settings, "gemini_api_key", "k")
+    monkeypatch.setattr(models.settings, "central_url", "http://central.test:8080")
+
+    async def up(http=None):
+        return True, "GET http://central.test:8080/api/incidents -> HTTP 200"
+
+    async def down(http=None):
+        return False, "GET http://central.test:8080/api/incidents failed: ConnectError"
+
+    with make_client(FakeClient(tool_response(0.9))) as c:
+        monkeypatch.setattr("app.ping_central", up)
+        checks = c.get("/ready").json()["checks"]
+        assert checks["central_reachable"] is True and "HTTP 200" in checks["central_detail"]
+        monkeypatch.setattr("app.ping_central", down)
+        r = c.get("/ready")
+        assert r.status_code == 200 and r.json()["checks"]["central_reachable"] is False
+
+
 def test_prompt_recommendation_failure_uses_default(monkeypatch):
     monkeypatch.setattr(models.settings, "gemini_api_key", "test-key")
 

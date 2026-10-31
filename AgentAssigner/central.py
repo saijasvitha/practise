@@ -47,6 +47,20 @@ def normalize_incident(doc: dict) -> dict:
     return out
 
 
+async def ping_central(http: Optional[httpx.AsyncClient] = None) -> tuple[bool, str]:
+    """Checks that the central service answers on GET /api/incidents. Never raises."""
+    url = f"{settings.central_url}/api/incidents"
+    client = http or httpx.AsyncClient(timeout=3)
+    try:
+        resp = await client.get(url)
+        return resp.status_code < 500, f"GET {url} -> HTTP {resp.status_code}"
+    except Exception as exc:
+        return False, f"GET {url} failed: {exc!r}"
+    finally:
+        if http is None:
+            await client.aclose()
+
+
 async def push_status(bug_id: str, action: str, http: Optional[httpx.AsyncClient] = None) -> str:
     """POSTs approve/reject for the incident on the central service. Never raises."""
     assert action in ("approve", "reject")
