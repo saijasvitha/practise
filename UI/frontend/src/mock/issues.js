@@ -1,0 +1,7 @@
+export const issues=[
+{id:'INC-2048',title:'Checkout requests timing out',description:'Elevated timeout rate during payment authorization across the primary checkout path.',service:'Payments API',severity:'Critical',environment:'Production',timestamp:'2 min ago',status:'Investigating'},
+{id:'INC-2047',title:'Worker queue depth increasing',description:'Background jobs are accumulating faster than workers can process them.',service:'Job Orchestrator',severity:'High',environment:'Production',timestamp:'14 min ago',status:'New'},
+{id:'INC-2046',title:'Search results are stale',description:'Search index updates are delayed for recently changed catalog items.',service:'Search Service',severity:'Medium',environment:'Staging',timestamp:'38 min ago',status:'Queued'},
+{id:'INC-2045',title:'Elevated memory on API nodes',description:'Memory usage crossed the warning threshold on two API nodes.',service:'Customer API',severity:'High',environment:'Production',timestamp:'1 hr ago',status:'Awaiting Developer'},
+{id:'INC-2044',title:'Webhook delivery recovered',description:'A brief delivery delay has cleared and pending events were retried.',service:'Webhook Gateway',severity:'Low',environment:'Production',timestamp:'3 hrs ago',status:'Resolved'},
+{id:'INC-2043',title:'Import task exited unexpectedly',description:'A scheduled catalog import stopped before processing the full file.',service:'Data Importer',severity:'Medium',environment:'Development',timestamp:'5 hrs ago',status:'Failed'}];
