@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 RETRY_DELAYS = (1, 3)  # seconds between attempts; 3 attempts in total
 
 
+# Sends the investigation summary to the backend callback URL with retries; never raises.
 async def notify_callback(
     summary: InvestigationSummary, http: Optional[httpx.AsyncClient] = None
 ) -> str:

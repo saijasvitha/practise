@@ -4,6 +4,7 @@ from pathlib import Path
 from models import Investigation, settings
 
 
+# Renders an Investigation (status, incident, logs, root cause, remediation, audit trail) as a Markdown report.
 def build_report(inv: Investigation) -> str:
     a = inv.analysis
     lines = [
@@ -56,6 +57,7 @@ def build_report(inv: Investigation) -> str:
     return "\n".join(lines) + "\n"
 
 
+# Writes the report to <reports_dir>/<bug_id>.md, sanitising the bug ID for the file name.
 def save_report(inv: Investigation) -> Path:
     out_dir = Path(settings.reports_dir)
     out_dir.mkdir(parents=True, exist_ok=True)

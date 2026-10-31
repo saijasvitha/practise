@@ -72,6 +72,7 @@ class AgentError(Exception):
     pass
 
 
+# Builds a short plain-text summary of the bug (ID, description, and optional service/severity).
 def issue_summary(req: AcceptRequest) -> str:
     parts = [f"Bug ID: {req.bug_id}", f"Description: {req.description}"]
     if req.service:
@@ -81,6 +82,7 @@ def issue_summary(req: AcceptRequest) -> str:
     return "\n".join(parts)
 
 
+# Returns a generic investigation prompt, used when the LLM fails to recommend a custom one.
 def default_guidance(req: AcceptRequest) -> str:
     return (
         f"Analyse the logs for the issue '{req.description}'. Find the first error, the error "
@@ -89,6 +91,8 @@ def default_guidance(req: AcceptRequest) -> str:
     )
 
 
+# Assembles the full prompt sent to the LLM: issue summary, guidance, the last 200 log lines,
+# and any similar historical incidents with their resolutions.
 def build_user_prompt(
     req: AcceptRequest, logs: Optional[list[str]] = None, guidance: Optional[str] = None
 ) -> str:
@@ -112,10 +116,12 @@ def build_user_prompt(
 
 
 class DebugAgent:
+    # Sets the Claude model name and optionally accepts a pre-built client (e.g. for tests).
     def __init__(self, client: Optional[AsyncAnthropic] = None, model: Optional[str] = None):
         self.model = model or settings.anthropic_model
         self._client = client
 
+    # Lazily creates the Anthropic client on first use; fails if ANTHROPIC_API_KEY is not set.
     @property
     def client(self) -> AsyncAnthropic:
         if self._client is None:
@@ -126,6 +132,7 @@ class DebugAgent:
             )
         return self._client
 
+    # Asks Claude to write a tailored investigation prompt for this bug; raises AgentError on failure or empty reply.
     async def recommend_prompt(self, req: AcceptRequest) -> str:
         try:
             response = await self.client.messages.create(
@@ -141,6 +148,8 @@ class DebugAgent:
             raise AgentError("LLM returned an empty prompt")
         return text
 
+    # Sends the bug, logs and guidance to Claude, forcing a structured tool call, and returns the
+    # validated root-cause Analysis; raises AgentError if the call or the response is invalid.
     async def investigate(
         self, req: AcceptRequest, logs: Optional[list[str]] = None, guidance: Optional[str] = None
     ) -> Analysis:
@@ -182,6 +191,7 @@ JSON_SHAPE = """Respond with ONLY a JSON object in exactly this shape:
 }"""
 
 
+# Strips optional ```json fences from Gemini's reply and validates the JSON into an Analysis.
 def parse_json_analysis(text: str) -> Analysis:
     cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip())
     try:
@@ -193,10 +203,12 @@ def parse_json_analysis(text: str) -> Analysis:
 class GeminiAgent:
     """Calls the Google Gemini API (free tier available via Google AI Studio)."""
 
+    # Sets the Gemini model name and optionally accepts a shared HTTP client (e.g. for tests).
     def __init__(self, http_client: Optional[httpx.AsyncClient] = None, model: Optional[str] = None):
         self.model = model or settings.gemini_model
         self._http = http_client
 
+    # Posts to Gemini, retrying transient errors and moving through fallback models if one stays unavailable.
     async def _post_with_retry(
         self, client: httpx.AsyncClient, body: dict, headers: dict
     ) -> tuple[httpx.Response, str]:
@@ -223,6 +235,8 @@ class GeminiAgent:
             return last_resp, last_model
         raise AgentError(f"Gemini request failed: {last_error}")
 
+    # Builds the Gemini request (system + user text, optional JSON mode), sends it, and returns
+    # (reply text, model used); maps HTTP errors and blocked responses to AgentError.
     async def _generate(self, system: str, user: str, json_mode: bool) -> tuple[str, str]:
         if not settings.gemini_api_key:
             raise AgentError("GEMINI_API_KEY is not configured")
@@ -253,12 +267,15 @@ class GeminiAgent:
         except (KeyError, IndexError, ValueError) as exc:
             raise AgentError("Gemini returned no usable content (it may have been blocked)") from exc
 
+    # Asks Gemini to write a tailored investigation prompt for this bug; raises AgentError if empty.
     async def recommend_prompt(self, req: AcceptRequest) -> str:
         text, _ = await self._generate(PROMPT_WRITER_SYSTEM, issue_summary(req), json_mode=False)
         if not text.strip():
             raise AgentError("Gemini returned an empty prompt")
         return text.strip()
 
+    # Sends the bug, logs and guidance to Gemini in JSON mode, parses the reply into an Analysis,
+    # and records which model actually answered.
     async def investigate(
         self, req: AcceptRequest, logs: Optional[list[str]] = None, guidance: Optional[str] = None
     ) -> Analysis:
@@ -270,6 +287,7 @@ class GeminiAgent:
         return analysis
 
 
+# Factory: returns the Claude agent when LLM_PROVIDER is "anthropic", otherwise the Gemini agent.
 def create_agent():
     if settings.llm_provider == "anthropic":
         return DebugAgent()

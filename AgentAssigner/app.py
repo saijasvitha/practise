@@ -29,10 +29,13 @@ ACTIVE = {InvestigationStatus.QUEUED, InvestigationStatus.IN_PROGRESS}
 STATUS_ACTION = {InvestigationStatus.SUCCESS: "approve", InvestigationStatus.FAILED: "reject"}
 
 
+# Appends a timestamped entry to the investigation's audit trail.
 def log_event(inv: Investigation, event: str) -> None:
     inv.audit.append({"at": utcnow().isoformat(), "event": event})
 
 
+# Converts a full Investigation into the compact summary returned to the dashboard and backend.
+# `success` stays None while the investigation is still active.
 def summarize(inv: Investigation) -> InvestigationSummary:
     success = None
     if inv.status not in ACTIVE:
@@ -47,6 +50,7 @@ def summarize(inv: Investigation) -> InvestigationSummary:
     )
 
 
+# Fetches missing incident fields from the central service; raises AgentError if no description is available.
 async def enrich_from_central(inv: Investigation) -> bool:
     """Fills missing description/service/severity/logs from the central incident service.
 
@@ -68,6 +72,8 @@ async def enrich_from_central(inv: Investigation) -> bool:
     return logs_from_central
 
 
+# Background job that runs the full investigation: enrich, recommend prompt, collect logs, analyse,
+# set the final status, then save the report, notify the backend and push approve/reject to central.
 async def run_investigation(app: FastAPI, inv: Investigation) -> None:
     agent = app.state.agent
     inv.status = InvestigationStatus.IN_PROGRESS
@@ -134,6 +140,7 @@ async def run_investigation(app: FastAPI, inv: Investigation) -> None:
         store.save(inv)
 
 
+# FastAPI dependency that rejects requests with a wrong X-API-Key (only when a key is configured).
 async def require_api_key(x_api_key: str | None = Header(default=None)) -> None:
     """Service-to-service auth: enforced only when SERVICE_API_KEY is configured."""
     expected = settings.service_api_key
@@ -141,7 +148,9 @@ async def require_api_key(x_api_key: str | None = Header(default=None)) -> None:
         raise HTTPException(401, "Missing or invalid X-API-Key")
 
 
+# Application factory: builds the FastAPI app, wires CORS and all routes; an agent can be injected for tests.
 def create_app(agent=None) -> FastAPI:
+    # On startup, creates the LLM agent and reloads saved investigations from disk.
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         app.state.agent = agent or create_agent()
@@ -155,21 +164,25 @@ def create_app(agent=None) -> FastAPI:
     )
     secured = [Depends(require_api_key)]
 
+    # Looks up an investigation by bug ID, or raises 404 if none exists.
     def get_inv(bug_id: str) -> Investigation:
         inv = app.state.investigations.get(bug_id)
         if inv is None:
             raise HTTPException(404, f"No investigation found for bug '{bug_id}'")
         return inv
 
+    # Redirects the root URL to the interactive API docs.
     @app.get("/", include_in_schema=False)
     async def root():
         return RedirectResponse("/docs")
 
+    # Liveness endpoint: reports that the service is up, with the LLM provider and model.
     @app.get("/health")
     async def health():
         """Liveness probe: the process is up."""
         return {"status": "ok", "provider": settings.llm_provider, "model": app.state.agent.model}
 
+    # Readiness endpoint: returns 503 when the LLM API key is missing and reports the other configuration checks.
     @app.get("/ready")
     async def ready(response: Response):
         """Readiness probe: the service can actually run investigations."""
@@ -188,6 +201,8 @@ def create_app(agent=None) -> FastAPI:
             response.status_code = 503
         return {"ready": key_set, "checks": checks}
 
+    # Starts an investigation when the tick mark is clicked; returns the existing result instead of
+    # re-running if the bug is active or already succeeded (unless force=true).
     @app.post(
         "/api/investigations", response_model=InvestigationSummary, status_code=202, dependencies=secured
     )
@@ -210,15 +225,18 @@ def create_app(agent=None) -> FastAPI:
         background.add_task(run_investigation, app, inv)
         return summarize(inv)
 
+    # Returns the short status summary that the dashboard polls.
     @app.get("/api/investigations/{bug_id}", response_model=InvestigationSummary, dependencies=secured)
     async def get_status(bug_id: str):
         """Polled by the dashboard to display success / failure."""
         return summarize(get_inv(bug_id))
 
+    # Returns the full investigation record, including analysis and audit trail.
     @app.get("/api/investigations/{bug_id}/details", response_model=Investigation, dependencies=secured)
     async def get_details(bug_id: str):
         return get_inv(bug_id)
 
+    # Returns the Markdown report, or 409 while the investigation is still running.
     @app.get(
         "/api/investigations/{bug_id}/report", response_class=PlainTextResponse, dependencies=secured
     )

@@ -13,6 +13,7 @@ from logs import fetch_logs, parse_log_payload
 from models import AcceptRequest
 
 
+# Builds a fake Claude reply containing a tool_use analysis with the given confidence.
 def tool_response(confidence: float):
     block = SimpleNamespace(
         type="tool_use",
@@ -36,11 +37,13 @@ def tool_response(confidence: float):
 
 
 class FakeClient:
+    # Stores the canned response or error and exposes a fake `messages.create` that records its calls.
     def __init__(self, response=None, error=None):
         self.calls = []
         self._response, self._error = response, error
         self.messages = SimpleNamespace(create=self._create)
 
+    # Fake Anthropic call: records the arguments, then raises the error or returns the canned response.
     async def _create(self, **kwargs):
         self.calls.append(kwargs)
         if self._error:
@@ -48,6 +51,7 @@ class FakeClient:
         return self._response
 
 
+# Creates a test client for an app that uses the Claude agent with the fake Anthropic client.
 def make_client(fake):
     return TestClient(create_app(DebugAgent(client=fake, model="test-model")))
 
@@ -55,6 +59,7 @@ def make_client(fake):
 PAYLOAD = {"bug_id": "BUG-1", "description": "Checkout API timing out", "service": "checkout"}
 
 
+# Autouse fixture: points reports/data to a temp folder and clears external settings so tests are isolated.
 @pytest.fixture(autouse=True)
 def reports_dir(tmp_path, monkeypatch):
     monkeypatch.setattr(models.settings, "reports_dir", str(tmp_path / "reports"))
@@ -69,6 +74,7 @@ def reports_dir(tmp_path, monkeypatch):
     monkeypatch.setattr(models.settings, "gemini_fallback_models", [])
 
 
+# Accepting a bug with high confidence ends in SUCCESS and produces a report.
 def test_accept_then_success_and_report():
     fake = FakeClient(tool_response(0.9))
     with make_client(fake) as c:
@@ -85,6 +91,7 @@ def test_accept_then_success_and_report():
         assert fake.calls[-1]["tool_choice"]["name"] == "submit_analysis"
 
 
+# Low-confidence analysis ends in NEEDS_REVIEW, not success.
 def test_low_confidence_needs_review():
     with make_client(FakeClient(tool_response(0.2))) as c:
         c.post("/api/investigations", json=PAYLOAD)
@@ -92,6 +99,7 @@ def test_low_confidence_needs_review():
         assert s["status"] == "NEEDS_REVIEW" and s["success"] is False
 
 
+# An LLM error marks the investigation FAILED and records the error in details and report.
 def test_llm_failure_reports_failed():
     with make_client(FakeClient(error=RuntimeError("boom"))) as c:
         c.post("/api/investigations", json=PAYLOAD)
@@ -101,12 +109,14 @@ def test_llm_failure_reports_failed():
         assert "Error" in c.get("/api/investigations/BUG-1/report").text
 
 
+# Unknown bug IDs return 404 and an empty bug ID is rejected with 422.
 def test_unknown_bug_and_validation():
     with make_client(FakeClient(tool_response(0.9))) as c:
         assert c.get("/api/investigations/NOPE").status_code == 404
         assert c.post("/api/investigations", json={"bug_id": "", "description": "x"}).status_code == 422
 
 
+# A missing Anthropic API key makes the investigation FAILED instead of crashing.
 def test_missing_api_key_fails_gracefully(monkeypatch):
     monkeypatch.setattr(models.settings, "anthropic_api_key", "")
     with TestClient(create_app(DebugAgent())) as c:
@@ -123,14 +133,17 @@ GEMINI_JSON = (
 )
 
 
+# Creates a test client for an app that uses the Gemini agent over a mocked HTTP transport.
 def gemini_client(handler):
     return make_gemini(httpx.AsyncClient(transport=httpx.MockTransport(handler)))
 
 
+# Builds a test client around a GeminiAgent that uses the given HTTP client.
 def make_gemini(http):
     return TestClient(create_app(GeminiAgent(http_client=http, model="gemini-test")))
 
 
+# Gemini replies wrapped in ```json fences are parsed, and the API key and model URL are sent correctly.
 def test_gemini_success_with_fenced_json(monkeypatch):
     monkeypatch.setattr(models.settings, "gemini_api_key", "test-key")
     seen = {}
@@ -148,6 +161,7 @@ def test_gemini_success_with_fenced_json(monkeypatch):
     assert seen["key"] == "test-key" and "gemini-test:generateContent" in seen["url"]
 
 
+# A Gemini 429 gives a rate-limit error, and a missing Gemini key gives a clear configuration error.
 def test_gemini_rate_limit_and_missing_key(monkeypatch):
     monkeypatch.setattr(models.settings, "gemini_api_key", "test-key")
     with gemini_client(lambda r: httpx.Response(429, json={})) as c:
@@ -161,6 +175,7 @@ def test_gemini_rate_limit_and_missing_key(monkeypatch):
         assert "GEMINI_API_KEY" in c.get("/api/investigations/BUG-1/details").json()["error"]
 
 
+# Non-JSON output from Gemini makes the investigation FAILED.
 def test_gemini_garbage_output_fails(monkeypatch):
     monkeypatch.setattr(models.settings, "gemini_api_key", "test-key")
     body = {"candidates": [{"content": {"parts": [{"text": "not json"}]}}]}
@@ -169,6 +184,7 @@ def test_gemini_garbage_output_fails(monkeypatch):
         assert c.get("/api/investigations/BUG-1").json()["status"] == "FAILED"
 
 
+# Transient 503 errors from Gemini are retried until the request succeeds.
 def test_gemini_retries_transient_overload(monkeypatch):
     monkeypatch.setattr(models.settings, "gemini_api_key", "test-key")
     attempts = {"json": 0}
@@ -187,6 +203,7 @@ def test_gemini_retries_transient_overload(monkeypatch):
     assert attempts["json"] == 3
 
 
+# When the primary Gemini model stays overloaded, a fallback model answers and is recorded.
 def test_gemini_falls_back_to_another_model_when_overloaded(monkeypatch):
     monkeypatch.setattr(models.settings, "gemini_api_key", "test-key")
     monkeypatch.setattr(models.settings, "gemini_fallback_models", ["backup-model"])
@@ -205,6 +222,7 @@ def test_gemini_falls_back_to_another_model_when_overloaded(monkeypatch):
     assert any("fallback model backup-model" in e["event"] for e in d["audit"])
 
 
+# parse_log_payload handles JSON lists, wrapped lists, unknown objects and plain text.
 def test_parse_log_payload_formats():
     assert parse_log_payload('["a", "b"]') == ["a", "b"]
     assert parse_log_payload('{"logs": [{"level": "ERROR", "message": "db down"}]}') == ["ERROR db down"]
@@ -212,10 +230,12 @@ def test_parse_log_payload_formats():
     assert parse_log_payload("line1\n\nline2\n") == ["line1", "line2"]
 
 
+# Helper that runs an async coroutine to completion from a sync test.
 def run(coro):
     return asyncio.run(coro)
 
 
+# Logs are fetched from the log REST API, with {service} and {bug_id} filled into the URL.
 def test_fetch_logs_from_rest_api(monkeypatch):
     monkeypatch.setattr(models.settings, "log_api_url", "http://logs.test/logs?service={service}&id={bug_id}")
     seen = {}
@@ -230,6 +250,7 @@ def test_fetch_logs_from_rest_api(monkeypatch):
     assert seen["url"] == "http://logs.test/logs?service=checkout&id=BUG-1"
 
 
+# When the log API fails, logs come from the local file, filtered to the service.
 def test_fetch_logs_falls_back_to_file(monkeypatch, tmp_path):
     log_file = tmp_path / "app.log"
     log_file.write_text("INFO checkout ok\nERROR checkout pool exhausted\nINFO billing ok\n")
@@ -241,11 +262,13 @@ def test_fetch_logs_falls_back_to_file(monkeypatch, tmp_path):
     assert "log file" in res.source and any("log API unavailable" in n for n in res.notes)
 
 
+# With no log source configured, no lines are returned and a note explains why.
 def test_fetch_logs_nothing_configured():
     res = run(fetch_logs(AcceptRequest(**PAYLOAD)))
     assert res.lines == [] and res.source == "none" and res.notes
 
 
+# The recommended prompt and collected logs are sent to the AI and shown in the report.
 def test_prompt_and_logs_reach_the_ai_and_report(monkeypatch, tmp_path):
     log_file = tmp_path / "svc.log"
     log_file.write_text("ERROR checkout timeout acquiring DB connection\n")
@@ -275,6 +298,7 @@ def test_prompt_and_logs_reach_the_ai_and_report(monkeypatch, tmp_path):
     assert "Look for connection pool errors" in analysis_prompt
 
 
+# /ready reports whether the central service is reachable, without becoming unready when it is down.
 def test_ready_reports_central_connectivity(monkeypatch):
     monkeypatch.setattr(models.settings, "gemini_api_key", "k")
     monkeypatch.setattr(models.settings, "central_url", "http://central.test:8080")
@@ -294,6 +318,7 @@ def test_ready_reports_central_connectivity(monkeypatch):
         assert r.status_code == 200 and r.json()["checks"]["central_reachable"] is False
 
 
+# If recommending a prompt fails, the default prompt is used and the investigation still succeeds.
 def test_prompt_recommendation_failure_uses_default(monkeypatch):
     monkeypatch.setattr(models.settings, "gemini_api_key", "test-key")
 
@@ -309,6 +334,7 @@ def test_prompt_recommendation_failure_uses_default(monkeypatch):
         assert any("using default prompt" in e["event"] for e in d["audit"])
 
 
+# With SERVICE_API_KEY set, the API requires X-API-Key while /health stays open.
 def test_api_key_protects_api_but_not_health(monkeypatch):
     monkeypatch.setattr(models.settings, "service_api_key", "s3cret")
     with make_client(FakeClient(tool_response(0.9))) as c:
@@ -321,6 +347,7 @@ def test_api_key_protects_api_but_not_health(monkeypatch):
         assert c.get("/api/investigations/BUG-1", headers={"X-API-Key": "s3cret"}).status_code == 200
 
 
+# /ready returns 503 without an LLM API key and 200 once a key is set.
 def test_readiness_reflects_llm_key(monkeypatch):
     with make_client(FakeClient(tool_response(0.9))) as c:
         monkeypatch.setattr(models.settings, "llm_provider", "gemini")
@@ -331,6 +358,7 @@ def test_readiness_reflects_llm_key(monkeypatch):
         assert c.get("/ready").status_code == 200
 
 
+# Saved investigations are reloaded after a restart, and runs that were in progress become FAILED.
 def test_investigations_survive_restart_and_interrupted_ones_fail():
     with make_client(FakeClient(tool_response(0.9))) as c:
         c.post("/api/investigations", json=PAYLOAD)
@@ -351,6 +379,7 @@ def test_investigations_survive_restart_and_interrupted_ones_fail():
         assert s["status"] == "FAILED" and "restart" in s["message"]
 
 
+# The callback is retried after a server error and finally delivers the summary with the API key.
 def test_callback_delivers_summary_with_retry(monkeypatch):
     from callback import notify_callback
 
@@ -372,6 +401,7 @@ def test_callback_delivers_summary_with_retry(monkeypatch):
     assert calls[1][0]["bug_id"] == "BUG-1" and calls[1][0]["status"] == "SUCCESS" and calls[1][1] == "cb-key"
 
 
+# A permanently failing callback reports failure without raising.
 def test_callback_failure_is_non_fatal(monkeypatch):
     from callback import notify_callback
 
@@ -384,6 +414,7 @@ def test_callback_failure_is_non_fatal(monkeypatch):
     assert "failed after retries" in run(notify_callback(summary, http))
 
 
+# Finishing an investigation sends exactly one callback and logs it in the audit trail.
 def test_finished_investigation_triggers_callback(monkeypatch):
     sent = []
 
@@ -400,6 +431,7 @@ def test_finished_investigation_triggers_callback(monkeypatch):
     assert any("Backend notification" in e["event"] for e in d["audit"])
 
 
+# normalize_incident maps different field-name spellings and falls back to the raw document.
 def test_normalize_incident_handles_common_field_names():
     from central import normalize_incident
 
@@ -412,6 +444,7 @@ def test_normalize_incident_handles_common_field_names():
     assert "unknown" in normalize_incident({"id": "1", "weird": "unknown"})["description"]
 
 
+# fetch_incident returns data on 200 and None for 404 and server errors.
 def test_fetch_incident_from_central(monkeypatch):
     from central import fetch_incident
 
@@ -434,6 +467,7 @@ def test_fetch_incident_from_central(monkeypatch):
     assert data is None and "unavailable" in note
 
 
+# A description is required unless the central service is configured to supply it.
 def test_description_required_unless_central_configured(monkeypatch):
     with make_client(FakeClient(tool_response(0.9))) as c:
         assert c.post("/api/investigations", json={"bug_id": "BUG-1"}).status_code == 422
@@ -454,6 +488,7 @@ def test_description_required_unless_central_configured(monkeypatch):
     assert "ERROR cart npe" in fake.calls[-1]["messages"][0]["content"]
 
 
+# If central is down and no description was given, the investigation fails with a clear message.
 def test_central_down_and_no_description_fails_clearly(monkeypatch):
     monkeypatch.setattr(models.settings, "central_url", "http://central.test:8080")
 
@@ -467,6 +502,7 @@ def test_central_down_and_no_description_fails_clearly(monkeypatch):
         assert d["status"] == "FAILED" and "description is missing" in d["error"]
 
 
+# If central is down but a description was given, the investigation still succeeds.
 def test_central_down_but_description_given_still_succeeds(monkeypatch):
     monkeypatch.setattr(models.settings, "central_url", "http://central.test:8080")
 
@@ -479,6 +515,7 @@ def test_central_down_but_description_given_still_succeeds(monkeypatch):
         assert c.get("/api/investigations/BUG-1").json()["status"] == "SUCCESS"
 
 
+# The {bug_id} placeholder in the callback URL is replaced with the URL-encoded bug ID.
 def test_callback_url_supports_bug_id_placeholder(monkeypatch):
     from callback import notify_callback
 
@@ -492,6 +529,7 @@ def test_callback_url_supports_bug_id_placeholder(monkeypatch):
     assert seen == ["http://central.test:8080/api/incidents/BUG%201/ai-result"]
 
 
+# push_status POSTs approve/reject to central with the X-Initiated-By marker header.
 def test_push_status_calls_central_with_marker_header(monkeypatch):
     from central import push_status
 
@@ -510,6 +548,7 @@ def test_push_status_calls_central_with_marker_header(monkeypatch):
     assert "failed" in run(push_status("BUG-1", "reject", bad))
 
 
+# Helper: enables central integration with fake fetch/push functions and returns the list of pushed actions.
 def central_pushes(monkeypatch):
     monkeypatch.setattr(models.settings, "central_url", "http://central.test:8080")
     pushed = []
@@ -526,6 +565,7 @@ def central_pushes(monkeypatch):
     return pushed
 
 
+# A successful investigation pushes "approve" to the central service.
 def test_success_pushes_approve_to_central(monkeypatch):
     pushed = central_pushes(monkeypatch)
     with make_client(FakeClient(tool_response(0.9))) as c:
@@ -536,6 +576,7 @@ def test_success_pushes_approve_to_central(monkeypatch):
     assert any("central approve succeeded" in e["event"] for e in d["audit"])
 
 
+# A failed investigation pushes "reject" to the central service.
 def test_failure_pushes_reject_to_central(monkeypatch):
     pushed = central_pushes(monkeypatch)
     with make_client(FakeClient(error=RuntimeError("boom"))) as c:
@@ -544,6 +585,7 @@ def test_failure_pushes_reject_to_central(monkeypatch):
     assert pushed == [("BUG-1", "reject")]
 
 
+# A low-confidence result pushes nothing to central and leaves the bug for an engineer.
 def test_low_confidence_pushes_nothing(monkeypatch):
     pushed = central_pushes(monkeypatch)
     with make_client(FakeClient(tool_response(0.2))) as c:
@@ -553,6 +595,7 @@ def test_low_confidence_pushes_nothing(monkeypatch):
     assert any("No status pushed" in e["event"] for e in d["audit"])
 
 
+# Pushing status to central can be turned off with central_push_status.
 def test_push_can_be_disabled(monkeypatch):
     pushed = central_pushes(monkeypatch)
     monkeypatch.setattr(models.settings, "central_push_status", False)
@@ -561,6 +604,7 @@ def test_push_can_be_disabled(monkeypatch):
     assert pushed == []
 
 
+# Central's callback after our own approve doesn't start a new run; force=true does re-run.
 def test_callback_from_central_after_success_does_not_loop(monkeypatch):
     pushed = central_pushes(monkeypatch)
     fake = FakeClient(tool_response(0.9))

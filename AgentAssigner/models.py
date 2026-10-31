@@ -42,6 +42,7 @@ class Settings:
 settings = Settings()
 
 
+# Returns the current time as a timezone-aware UTC datetime.
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 

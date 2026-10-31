@@ -23,6 +23,7 @@ class LogResult:
     notes: list[str] = field(default_factory=list)  # why a source was skipped, for the audit trail
 
 
+# Converts one log entry (dict or plain value) into a single trimmed text line.
 def _format_entry(entry) -> str:
     if isinstance(entry, dict):
         known = [str(entry[k]) for k in ("timestamp", "time", "level", "service", "message", "msg") if k in entry]
@@ -32,6 +33,7 @@ def _format_entry(entry) -> str:
     return text.strip()[:MAX_LINE_CHARS]
 
 
+# Parses a log API response body (JSON or plain text) into a list of log lines.
 def parse_log_payload(body: str) -> list[str]:
     """Accepts a JSON list, a JSON object wrapping a list, or plain text lines."""
     try:
@@ -47,10 +49,12 @@ def parse_log_payload(body: str) -> list[str]:
     return [line for line in (_format_entry(e) for e in data) if line]
 
 
+# Splits plain text into trimmed, non-empty, length-capped lines.
 def parse_log_payload_lines(text: str) -> list[str]:
     return [ln.strip()[:MAX_LINE_CHARS] for ln in text.splitlines() if ln.strip()]
 
 
+# Reads the configured log file (or the newest .log/.txt in a folder) and keeps lines mentioning the bug ID or service.
 def _read_log_file(req: AcceptRequest) -> list[str]:
     path = Path(settings.log_file_path)
     if path.is_dir():
@@ -64,6 +68,7 @@ def _read_log_file(req: AcceptRequest) -> list[str]:
     return relevant or lines
 
 
+# Main entry point for log collection: configured sources first, then logs supplied in the request.
 async def fetch_logs(
     req: AcceptRequest, http: Optional[httpx.AsyncClient] = None, request_label: str = "request body"
 ) -> LogResult:
@@ -75,6 +80,7 @@ async def fetch_logs(
     return fetched
 
 
+# Tries the log REST API, then the local log file; records why a source was skipped.
 async def _fetch_configured_logs(req: AcceptRequest, http: Optional[httpx.AsyncClient]) -> LogResult:
     limit = settings.log_max_lines
     result = LogResult()

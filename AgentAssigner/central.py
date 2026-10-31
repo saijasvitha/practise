@@ -20,6 +20,7 @@ FIELD_ALIASES = {
 MAX_LINE_CHARS = 500
 
 
+# Turns a logs value (string, list, or mixed items) into a clean list of non-empty, length-capped lines.
 def _logs_to_lines(value) -> list[str]:
     if value is None:
         return []
@@ -35,6 +36,8 @@ def _logs_to_lines(value) -> list[str]:
     return lines
 
 
+# Maps an incident document with varying field names to description/service/severity/logs;
+# falls back to the raw JSON as the description if none is found.
 def normalize_incident(doc: dict) -> dict:
     out: dict = {}
     for target, aliases in FIELD_ALIASES.items():
@@ -47,6 +50,7 @@ def normalize_incident(doc: dict) -> dict:
     return out
 
 
+# Checks whether the central service is reachable, for the readiness endpoint.
 async def ping_central(http: Optional[httpx.AsyncClient] = None) -> tuple[bool, str]:
     """Checks that the central service answers on GET /api/incidents. Never raises."""
     url = f"{settings.central_url}/api/incidents"
@@ -61,6 +65,7 @@ async def ping_central(http: Optional[httpx.AsyncClient] = None) -> tuple[bool, 
             await client.aclose()
 
 
+# Tells the central service to approve or reject the incident, retrying once on server errors.
 async def push_status(bug_id: str, action: str, http: Optional[httpx.AsyncClient] = None) -> str:
     """POSTs approve/reject for the incident on the central service. Never raises."""
     assert action in ("approve", "reject")
@@ -87,6 +92,7 @@ async def push_status(bug_id: str, action: str, http: Optional[httpx.AsyncClient
     return f"central {action} failed: {last_error}"
 
 
+# Downloads the incident from the central service and returns its normalized fields plus an audit note.
 async def fetch_incident(
     bug_id: str, http: Optional[httpx.AsyncClient] = None
 ) -> tuple[Optional[dict], str]:

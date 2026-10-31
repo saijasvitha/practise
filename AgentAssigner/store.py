@@ -7,11 +7,13 @@ from models import Investigation, InvestigationStatus, settings, utcnow
 logger = logging.getLogger(__name__)
 
 
+# Builds the JSON file path for a bug ID, replacing unsafe characters.
 def _path(bug_id: str) -> Path:
     safe_id = "".join(c if c.isalnum() or c in "-_" else "_" for c in bug_id)
     return Path(settings.data_dir) / f"{safe_id}.json"
 
 
+# Saves an investigation to disk atomically (temp file, then rename); logs instead of raising on I/O errors.
 def save(inv: Investigation) -> None:
     try:
         path = _path(inv.bug_id)
@@ -23,6 +25,7 @@ def save(inv: Investigation) -> None:
         logger.exception("Could not persist investigation %s", inv.bug_id)
 
 
+# Loads all saved investigations at startup and marks any that were mid-run as FAILED (interrupted by restart).
 def load_all() -> dict[str, Investigation]:
     result: dict[str, Investigation] = {}
     folder = Path(settings.data_dir)
